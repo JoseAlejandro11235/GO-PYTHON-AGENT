@@ -127,10 +127,62 @@ html, body {
   border-bottom: 1px solid var(--border);
   padding: 6px 10px;
   font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .tab {
   color: var(--accent);
+  flex: 1;
+  min-width: 0;
+}
+
+.tab-run {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.editor-console-stack {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 120px;
+}
+
+.console-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 100px;
+  max-height: 40vh;
+  border-top: 1px solid var(--border);
+  background: #161616;
+}
+
+.console-title {
+  flex-shrink: 0;
+}
+
+.console-output {
+  flex: 1;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .CodeMirror {

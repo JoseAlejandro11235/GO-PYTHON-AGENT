@@ -1,4 +1,4 @@
-"""Sample Python module for the Truora workspace."""
+"""Sample Python module for the workspace."""
 
 def main() -> None:
     print("Hola mi amor")

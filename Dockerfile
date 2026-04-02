@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /cursorlite .
 
 # Run
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata python3
 WORKDIR /app
 COPY --from=build /cursorlite /app/cursorlite
 ENV WORKSPACE_ROOT=/workspace

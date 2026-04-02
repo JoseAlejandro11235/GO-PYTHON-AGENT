@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Truora Agent — Python</title>
+  <title>Cursorlite — Python workspace</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header class="top">
-    <span class="logo">Truora · Python</span>
+    <span class="logo">Cursorlite · Python</span>
     <span id="status" class="status"></span>
     <button type="button" id="saveBtn" class="btn primary">Save</button>
   </header>
@@ -22,6 +22,14 @@
     <main class="editor-wrap">
       <div class="tabs">
         <span id="openFile" class="tab">No file</span>
+        <button type="button" id="runPythonBtn" class="btn tab-run" title="Run current editor as Python">Run ▶</button>
+      </div>
+      <div class="editor-console-stack">
+        <div id="editorArea" class="editor-area"></div>
+        <div class="console-panel">
+          <div class="panel-title console-title">Python output</div>
+          <pre id="consoleOutput" class="console-output"></pre>
+        </div>
       </div>
       <textarea id="editorFallback" hidden></textarea>
     </main>

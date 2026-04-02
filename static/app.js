@@ -5,7 +5,9 @@ const saveBtn = document.getElementById("saveBtn");
 const chatForm = document.getElementById("chatForm");
 const chatInput = document.getElementById("chatInput");
 const chatLog = document.getElementById("chatLog");
-const editorHost = document.querySelector(".editor-wrap");
+const editorArea = document.getElementById("editorArea");
+const runPythonBtn = document.getElementById("runPythonBtn");
+const consoleOutput = document.getElementById("consoleOutput");
 
 /** @type {import("codemirror").Editor | null} */
 let cm = null;
@@ -36,7 +38,7 @@ function modeForPath(p) {
 function ensureCM() {
   if (cm) return cm;
   const ta = document.createElement("textarea");
-  editorHost.appendChild(ta);
+  editorArea.appendChild(ta);
   // @ts-ignore — global CodeMirror from CDN
   cm = CodeMirror.fromTextArea(ta, {
     theme: "dracula",
@@ -45,12 +47,59 @@ function ensureCM() {
     tabSize: 4,
     lineWrapping: true,
   });
-  const cmEl = editorHost.querySelector(".CodeMirror");
+  const cmEl = editorArea.querySelector(".CodeMirror");
   if (cmEl) {
     cmEl.style.flex = "1";
     cmEl.style.minHeight = "0";
   }
   return cm;
+}
+
+async function runPythonInConsole() {
+  const editor = ensureCM();
+  const code = editor.getValue();
+  if (!code.trim()) {
+    setStatus("Editor is empty — add Python code to run", true);
+    return;
+  }
+  let cwd = "";
+  if (currentPath) {
+    const i = currentPath.lastIndexOf("/");
+    cwd = i >= 0 ? currentPath.slice(0, i) : "";
+  }
+  setStatus("Running Python…");
+  consoleOutput.textContent = "";
+  try {
+    const res = await fetch("/api/run-python", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, cwd }),
+    });
+    const raw = await res.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { error: raw || res.statusText };
+    }
+    const lines = [];
+    if (data.error && !data.stderr) lines.push("Error: " + data.error);
+    if (data.stdout) lines.push(data.stdout);
+    if (data.stderr) lines.push(data.stderr);
+    const exit = typeof data.exitCode === "number" ? data.exitCode : 0;
+    lines.push(`\n— Exit code: ${exit}`);
+    consoleOutput.textContent = lines.filter(Boolean).join("\n");
+    if (data.error && res.ok) {
+      setStatus(String(data.error), true);
+    } else if (!res.ok) {
+      setStatus(data.error || res.statusText || "Run failed", true);
+    } else {
+      setStatus("Run finished");
+    }
+  } catch (e) {
+    consoleOutput.textContent = String(e);
+    setStatus(String(e), true);
+  }
 }
 
 async function loadTree(dir) {
@@ -195,6 +244,10 @@ chatForm.addEventListener("submit", async (ev) => {
     chatLog.appendChild(err);
   }
   chatLog.scrollTop = chatLog.scrollHeight;
+});
+
+runPythonBtn.addEventListener("click", () => {
+  runPythonInConsole();
 });
 
 refreshRoot();

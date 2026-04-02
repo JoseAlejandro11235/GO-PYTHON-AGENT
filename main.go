@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"embed"
 )
@@ -54,6 +57,9 @@ func main() {
 	mux.HandleFunc("POST /api/chat", func(w http.ResponseWriter, r *http.Request) {
 		handleChat(w, r, root)
 	})
+	mux.HandleFunc("POST /api/run-python", func(w http.ResponseWriter, r *http.Request) {
+		handleRunPython(w, r, root)
+	})
 
 	log.Printf("cursorlite serving workspace %s on http://0.0.0.0%s", root, addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
@@ -66,6 +72,128 @@ func safeRel(root, rel string) (string, error) {
 	}
 	full := filepath.Join(root, rel)
 	return full, nil
+}
+
+const maxPythonOutput = 512 << 10 // 512 KiB per stream
+
+type runPythonReq struct {
+	Code   string `json:"code"`
+	CwdRel string `json:"cwd,omitempty"` // optional directory under workspace (forward slashes ok)
+}
+
+type runPythonResp struct {
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exitCode"`
+	Error    string `json:"error,omitempty"`
+}
+
+func handleRunPython(w http.ResponseWriter, r *http.Request, root string) {
+	var req runPythonReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	code := strings.TrimRight(req.Code, "\n")
+	if code == "" {
+		http.Error(w, "code is empty", http.StatusBadRequest)
+		return
+	}
+	cwdRel := strings.TrimSpace(req.CwdRel)
+	cwdRel = filepath.ToSlash(filepath.Clean(cwdRel))
+	cwdRel = strings.TrimPrefix(cwdRel, "/")
+	var workDir string
+	if cwdRel == "" || cwdRel == "." {
+		workDir = root
+	} else {
+		full, err := safeRel(root, cwdRel)
+		if err != nil || !underRoot(root, full) {
+			http.Error(w, "bad cwd", http.StatusBadRequest)
+			return
+		}
+		st, err := os.Stat(full)
+		if err != nil || !st.IsDir() {
+			http.Error(w, "cwd is not a directory", http.StatusBadRequest)
+			return
+		}
+		workDir = full
+	}
+	pythonExe, err := resolvePythonExecutable()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runPythonResp{
+			Error: err.Error(),
+		})
+		return
+	}
+	timeout := 60 * time.Second
+	if s := strings.TrimSpace(os.Getenv("PYTHON_RUN_TIMEOUT")); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, pythonExe, "-u", "-")
+	cmd.Dir = workDir
+	cmd.Stdin = strings.NewReader(code + "\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &limitWriter{dst: &stdout, max: maxPythonOutput}
+	cmd.Stderr = &limitWriter{dst: &stderr, max: maxPythonOutput}
+	runErr := cmd.Run()
+	resp := runPythonResp{
+		Stdout: strings.TrimSuffix(stdout.String(), "\n"),
+		Stderr: strings.TrimSuffix(stderr.String(), "\n"),
+	}
+	if runErr != nil {
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			resp.Error = "python run timed out"
+			resp.ExitCode = -1
+		} else if ee := (*exec.ExitError)(nil); errors.As(runErr, &ee) {
+			resp.ExitCode = ee.ExitCode()
+		} else {
+			resp.Error = runErr.Error()
+			resp.ExitCode = -1
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type limitWriter struct {
+	dst *bytes.Buffer
+	max int
+	n   int
+}
+
+func (w *limitWriter) Write(p []byte) (int, error) {
+	remaining := w.max - w.n
+	if remaining <= 0 {
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		wn, _ := w.dst.Write(p[:remaining])
+		w.n += wn
+		_, _ = w.dst.WriteString("\n… (output truncated)\n")
+		w.n = w.max
+		return len(p), nil
+	}
+	wn, err := w.dst.Write(p)
+	w.n += wn
+	return len(p), err
+}
+
+func resolvePythonExecutable() (string, error) {
+	if p := strings.TrimSpace(os.Getenv("PYTHON_BIN")); p != "" {
+		return p, nil
+	}
+	for _, name := range []string{"python3", "python"} {
+		path, err := exec.LookPath(name)
+		if err == nil {
+			return path, nil
+		}
+	}
+	return "", errors.New("python not found on PATH (set PYTHON_BIN or install Python)")
 }
 
 func underRoot(root, full string) bool {
