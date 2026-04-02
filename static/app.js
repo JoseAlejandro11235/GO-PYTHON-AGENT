@@ -22,8 +22,9 @@ function modeForPath(p) {
     js: "javascript",
     mjs: "javascript",
     ts: "javascript",
-    go: "go",
     py: "python",
+    pyw: "python",
+    pyi: "python",
     html: "htmlmixed",
     xml: "xml",
     css: "css",
@@ -159,16 +160,34 @@ chatForm.addEventListener("submit", async (ev) => {
   userDiv.textContent = "You: " + msg;
   chatLog.appendChild(userDiv);
   try {
+    const payload = { message: msg };
+    if (currentPath && cm) {
+      payload.filePath = currentPath;
+      payload.fileContent = cm.getValue();
+    }
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
     const ans = document.createElement("div");
     ans.className = "msg" + (data.error ? " error" : "");
-    ans.textContent = data.error ? data.error : "Assistant: " + data.reply;
+    ans.textContent = data.error ? data.error : "Assistant: " + (data.reply ?? "");
     chatLog.appendChild(ans);
+    if (!data.error && Array.isArray(data.edits) && data.edits.length) {
+      for (const ed of data.edits) {
+        if (!ed.path) continue;
+        await saveFile(ed.path, ed.content ?? "");
+        if (cm && ed.path === currentPath) {
+          cm.setValue(ed.content ?? "");
+          const mode = modeForPath(ed.path);
+          if (mode) cm.setOption("mode", mode);
+        }
+      }
+      setStatus("Workspace updated from chat");
+      await refreshRoot();
+    }
   } catch (e) {
     const err = document.createElement("div");
     err.className = "msg error";

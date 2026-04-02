@@ -52,7 +52,7 @@ func main() {
 		handleWriteFile(w, r, root)
 	})
 	mux.HandleFunc("POST /api/chat", func(w http.ResponseWriter, r *http.Request) {
-		handleChat(w, r)
+		handleChat(w, r, root)
 	})
 
 	log.Printf("cursorlite serving workspace %s on http://0.0.0.0%s", root, addr)
@@ -201,17 +201,30 @@ func handleWriteFile(w http.ResponseWriter, r *http.Request, root string) {
 }
 
 type chatReq struct {
-	Message string `json:"message"`
+	Message     string `json:"message"`
+	FilePath    string `json:"filePath,omitempty"`
+	FileContent string `json:"fileContent,omitempty"`
+}
+
+type fileEdit struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 type chatResp struct {
-	Reply string `json:"reply"`
-	Error string `json:"error,omitempty"`
+	Reply string     `json:"reply"`
+	Edits []fileEdit `json:"edits,omitempty"`
+	Error string     `json:"error,omitempty"`
 }
 
-func handleChat(w http.ResponseWriter, r *http.Request) {
+type modelChatJSON struct {
+	Summary string     `json:"summary"`
+	Files   []fileEdit `json:"files"`
+}
+
+func handleChat(w http.ResponseWriter, r *http.Request, root string) {
 	var req chatReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -223,24 +236,112 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	if key == "" {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(chatResp{
-			Reply: "",
 			Error: "Set OPENAI_API_KEY in the container to enable chat. Example: docker compose with env from .env",
 		})
 		return
 	}
-	reply, err := openAIChat(base, key, req.Message)
 	w.Header().Set("Content-Type", "application/json")
+	raw, err := openAIChatStructured(base, key, req)
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(chatResp{Error: err.Error()})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(chatResp{Reply: reply})
+	summary, edits, perr := parseModelChatOutput(raw)
+	if perr != nil {
+		summary = strings.TrimSpace(raw)
+		edits = nil
+	} else if strings.TrimSpace(summary) == "" && len(edits) > 0 {
+		summary = "Applied updates to your workspace."
+	} else if strings.TrimSpace(summary) == "" && len(edits) == 0 {
+		summary = "Done."
+	}
+	validated := make([]fileEdit, 0, len(edits))
+	const maxEdit = 2 << 20 // 2 MiB per file from model
+	for _, e := range edits {
+		rel := strings.TrimSpace(e.Path)
+		rel = filepath.ToSlash(filepath.Clean(rel))
+		rel = strings.TrimPrefix(rel, "/")
+		if rel == "" || rel == "." {
+			continue
+		}
+		full, err := safeRel(root, rel)
+		if err != nil || !underRoot(root, full) {
+			continue
+		}
+		if len(e.Content) > maxEdit {
+			continue
+		}
+		validated = append(validated, fileEdit{Path: rel, Content: e.Content})
+	}
+	_ = json.NewEncoder(w).Encode(chatResp{Reply: summary, Edits: validated})
+}
+
+func chatSystemPrompt() string {
+	return `You are a Python development assistant inside a small web IDE. The user message includes their request and may include the currently open file path and its full contents.
+
+You MUST respond with a single JSON object only (no markdown fences), using this exact shape:
+{"summary":"Brief explanation shown in chat.","files":[{"path":"relative/path/from/workspace/root.py","content":"complete new file contents as a string"}]}
+
+Rules:
+- "files" is an array. Include every workspace file you create or change, each with full file text (not a diff).
+- Paths use forward slashes relative to the workspace root (e.g. "hello.py", "src/app.py").
+- If you only explain or answer without changing files, use "files": [].
+- Prefer idiomatic Python 3; keep code runnable and consistent with the user's request.
+- Produce strictly valid JSON: escape embedded quotes and newlines in strings as JSON requires.`
+}
+
+func buildChatUserPayload(req chatReq) string {
+	var b strings.Builder
+	b.WriteString("User request:\n")
+	b.WriteString(strings.TrimSpace(req.Message))
+	b.WriteString("\n\n")
+	if strings.TrimSpace(req.FilePath) != "" {
+		b.WriteString("Currently open file path (relative to workspace): ")
+		b.WriteString(strings.TrimSpace(req.FilePath))
+		b.WriteString("\n\nCurrent file contents:\n```\n")
+		b.WriteString(req.FileContent)
+		b.WriteString("\n```\n")
+	} else {
+		b.WriteString("No file is currently open in the editor. You may still add or modify files by path under \"files\".\n")
+	}
+	return b.String()
+}
+
+func parseModelChatOutput(raw string) (summary string, files []fileEdit, err error) {
+	raw = strings.TrimSpace(raw)
+	raw = stripMarkdownJSONFence(raw)
+	var out modelChatJSON
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return "", nil, err
+	}
+	return strings.TrimSpace(out.Summary), out.Files, nil
+}
+
+func stripMarkdownJSONFence(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	rest := strings.TrimSpace(s[3:])
+	if strings.HasPrefix(strings.ToLower(rest), "json") {
+		rest = strings.TrimSpace(rest[len("json"):])
+	}
+	if i := strings.Index(rest, "```"); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.TrimSpace(rest)
 }
 
 type openAIRequest struct {
-	Model    string              `json:"model"`
-	Messages []openAIMessage     `json:"messages"`
-	Stream   bool                `json:"stream"`
+	Model          string            `json:"model"`
+	Messages       []openAIMessage   `json:"messages"`
+	Stream         bool              `json:"stream"`
+	ResponseFormat *openAIRespFormat `json:"response_format,omitempty"`
+	MaxTokens      int               `json:"max_tokens,omitempty"`
+}
+
+type openAIRespFormat struct {
+	Type string `json:"type"`
 }
 
 type openAIMessage struct {
@@ -259,32 +360,34 @@ type openAIResponse struct {
 	} `json:"error"`
 }
 
-func openAIChat(baseURL, apiKey, userMsg string) (string, error) {
+func openAIChatStructured(baseURL, apiKey string, req chatReq) (string, error) {
 	model := os.Getenv("OPENAI_MODEL")
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
-	payload, _ := json.Marshal(openAIRequest{
-		Model: model,
-		Messages: []openAIMessage{
-			{Role: "system", Content: "You are a concise coding assistant inside a small web IDE."},
-			{Role: "user", Content: userMsg},
-		},
-		Stream: false,
-	})
-	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(baseURL, "/")+"/chat/completions", bytes.NewReader(payload))
+	msgs := []openAIMessage{
+		{Role: "system", Content: chatSystemPrompt()},
+		{Role: "user", Content: buildChatUserPayload(req)},
+	}
+	content, err := completeChat(baseURL, apiKey, model, msgs, true)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	return content, nil
+}
+
+func completeChat(baseURL, apiKey, model string, messages []openAIMessage, jsonMode bool) (string, error) {
+	body, status, err := postChatCompletions(baseURL, apiKey, model, messages, jsonMode)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if jsonMode && status == http.StatusBadRequest && shouldRetryChatWithoutJSON(body) {
+		body, status, err = postChatCompletions(baseURL, apiKey, model, messages, false)
+		if err != nil {
+			return "", err
+		}
+	}
+	if status < 200 || status >= 300 {
 		return "", errors.New("api: " + string(bytes.TrimSpace(body)))
 	}
 	var out openAIResponse
@@ -298,4 +401,38 @@ func openAIChat(baseURL, apiKey, userMsg string) (string, error) {
 		return "", errors.New("no completion")
 	}
 	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+}
+
+func shouldRetryChatWithoutJSON(apiBody []byte) bool {
+	s := strings.ToLower(string(apiBody))
+	return strings.Contains(s, "response_format") || strings.Contains(s, "json_object")
+}
+
+func postChatCompletions(baseURL, apiKey, model string, messages []openAIMessage, jsonMode bool) ([]byte, int, error) {
+	reqObj := openAIRequest{
+		Model:     model,
+		Messages:  messages,
+		Stream:    false,
+		MaxTokens: 8192,
+	}
+	if jsonMode {
+		reqObj.ResponseFormat = &openAIRespFormat{Type: "json_object"}
+	}
+	payload, err := json.Marshal(reqObj)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(baseURL, "/")+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	return body, resp.StatusCode, nil
 }
