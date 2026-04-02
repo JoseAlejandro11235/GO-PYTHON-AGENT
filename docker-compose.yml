@@ -1,0 +1,16 @@
+services:
+  cursorlite:
+    build: .
+    container_name: cursorlite
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      WORKSPACE_ROOT: /workspace
+      LISTEN_ADDR: ":8080"
+      # Optional overrides (also settable in .env): OPENAI_BASE_URL, OPENAI_MODEL
+    volumes:
+      # Project files edited in the IDE (host folder → container)
+      - ./workspace:/workspace
+    restart: unless-stopped
