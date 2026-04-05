@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +36,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	promptDB, err := openPromptDB(root)
+	if err != nil {
+		log.Fatalf("prompts db: %v", err)
+	}
+	defer promptDB.Close()
+
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":8080"
@@ -54,11 +62,23 @@ func main() {
 	mux.HandleFunc("PUT /api/file", func(w http.ResponseWriter, r *http.Request) {
 		handleWriteFile(w, r, root)
 	})
-	mux.HandleFunc("POST /api/chat", func(w http.ResponseWriter, r *http.Request) {
-		handleChat(w, r, root)
-	})
 	mux.HandleFunc("POST /api/run-python", func(w http.ResponseWriter, r *http.Request) {
 		handleRunPython(w, r, root)
+	})
+	mux.HandleFunc("GET /ws/run-python", func(w http.ResponseWriter, r *http.Request) {
+		handleRunPythonWS(w, r, root)
+	})
+	mux.HandleFunc("POST /api/agent-code", func(w http.ResponseWriter, r *http.Request) {
+		handleAgentCode(w, r, root, promptDB)
+	})
+	mux.HandleFunc("GET /api/prompts", func(w http.ResponseWriter, r *http.Request) {
+		handlePromptsAPI(w, r, promptDB)
+	})
+	mux.HandleFunc("GET /api/agent-undo-available", func(w http.ResponseWriter, r *http.Request) {
+		handleAgentUndoAvailable(w, r, root)
+	})
+	mux.HandleFunc("POST /api/agent-undo", func(w http.ResponseWriter, r *http.Request) {
+		handleAgentUndo(w, r, root)
 	})
 
 	log.Printf("cursorlite serving workspace %s on http://0.0.0.0%s", root, addr)
@@ -75,10 +95,15 @@ func safeRel(root, rel string) (string, error) {
 }
 
 const maxPythonOutput = 512 << 10 // 512 KiB per stream
+const maxPythonStdin = 1 << 20      // 1 MiB for Run stdin
+
+const cursorliteInternalDir = ".cursorlite"
+const cursorliteRunScript = "run.py"
 
 type runPythonReq struct {
 	Code   string `json:"code"`
 	CwdRel string `json:"cwd,omitempty"` // optional directory under workspace (forward slashes ok)
+	Stdin  string `json:"stdin,omitempty"` // fed to the Python process (e.g. input())
 }
 
 type runPythonResp struct {
@@ -99,44 +124,89 @@ func handleRunPython(w http.ResponseWriter, r *http.Request, root string) {
 		http.Error(w, "code is empty", http.StatusBadRequest)
 		return
 	}
-	cwdRel := strings.TrimSpace(req.CwdRel)
-	cwdRel = filepath.ToSlash(filepath.Clean(cwdRel))
-	cwdRel = strings.TrimPrefix(cwdRel, "/")
-	var workDir string
-	if cwdRel == "" || cwdRel == "." {
-		workDir = root
-	} else {
-		full, err := safeRel(root, cwdRel)
-		if err != nil || !underRoot(root, full) {
-			http.Error(w, "bad cwd", http.StatusBadRequest)
-			return
-		}
-		st, err := os.Stat(full)
-		if err != nil || !st.IsDir() {
-			http.Error(w, "cwd is not a directory", http.StatusBadRequest)
-			return
-		}
-		workDir = full
-	}
-	pythonExe, err := resolvePythonExecutable()
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(runPythonResp{
-			Error: err.Error(),
-		})
+	if len(req.Stdin) > maxPythonStdin {
+		http.Error(w, "stdin too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), pythonRunTimeout())
+	defer cancel()
+	resp, err := runPythonInWorkspace(ctx, root, code, req.CwdRel, req.Stdin)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// resolveWorkspaceWorkDir returns an absolute directory under root for running Python (cwdRel is relative to workspace).
+func resolveWorkspaceWorkDir(root, cwdRel string) (string, error) {
+	cwdRel = strings.TrimSpace(cwdRel)
+	cwdRel = filepath.ToSlash(filepath.Clean(cwdRel))
+	cwdRel = strings.TrimPrefix(cwdRel, "/")
+	if cwdRel == "" || cwdRel == "." {
+		return root, nil
+	}
+	full, err := safeRel(root, cwdRel)
+	if err != nil || !underRoot(root, full) {
+		return "", errors.New("bad cwd")
+	}
+	st, err := os.Stat(full)
+	if err != nil || !st.IsDir() {
+		return "", errors.New("cwd is not a directory")
+	}
+	return full, nil
+}
+
+func pythonRunTimeout() time.Duration {
 	timeout := 60 * time.Second
 	if s := strings.TrimSpace(os.Getenv("PYTHON_RUN_TIMEOUT")); s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
 			timeout = d
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, pythonExe, "-u", "-")
+	return timeout
+}
+
+// prepareCursorliteRunScript writes code to workDir/.cursorlite/run.py (hidden from explorer).
+func prepareCursorliteRunScript(workDir, code string) (scriptPath string, err error) {
+	dir := filepath.Join(workDir, cursorliteInternalDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	scriptPath = filepath.Join(dir, cursorliteRunScript)
+	if err := os.WriteFile(scriptPath, []byte(code), 0o644); err != nil {
+		return "", err
+	}
+	return scriptPath, nil
+}
+
+// runPythonInWorkspace writes code to a workspace script and runs it so process stdin is free for user input.
+// cwdRel is optional, relative to workspace root. stdin is optional data for input().
+// Returns a validation error for bad cwd or empty code; "python not found" is reported in runPythonResp.Error with nil err.
+func runPythonInWorkspace(ctx context.Context, root, code, cwdRel, stdin string) (runPythonResp, error) {
+	code = strings.TrimRight(strings.TrimSpace(code), "\n")
+	if code == "" {
+		return runPythonResp{}, errors.New("code is empty")
+	}
+	if len(stdin) > maxPythonStdin {
+		return runPythonResp{}, errors.New("stdin too large")
+	}
+	workDir, err := resolveWorkspaceWorkDir(root, cwdRel)
+	if err != nil {
+		return runPythonResp{}, err
+	}
+	scriptPath, err := prepareCursorliteRunScript(workDir, code)
+	if err != nil {
+		return runPythonResp{}, err
+	}
+	pythonExe, err := resolvePythonExecutable()
+	if err != nil {
+		return runPythonResp{Error: err.Error()}, nil
+	}
+	cmd := exec.CommandContext(ctx, pythonExe, "-u", scriptPath)
 	cmd.Dir = workDir
-	cmd.Stdin = strings.NewReader(code + "\n")
+	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &limitWriter{dst: &stdout, max: maxPythonOutput}
 	cmd.Stderr = &limitWriter{dst: &stderr, max: maxPythonOutput}
@@ -156,8 +226,67 @@ func handleRunPython(w http.ResponseWriter, r *http.Request, root string) {
 			resp.ExitCode = -1
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	return resp, nil
+}
+
+// runPythonModuleInWorkspace runs `python -m <module> [args...]` with cwd under the workspace (same limits as stdin runs).
+func runPythonModuleInWorkspace(ctx context.Context, root, cwdRel, module string, args ...string) runPythonResp {
+	module = strings.TrimSpace(module)
+	if module == "" {
+		return runPythonResp{Error: "module is empty", ExitCode: -1}
+	}
+	workDir, err := resolveWorkspaceWorkDir(root, cwdRel)
+	if err != nil {
+		return runPythonResp{Error: err.Error(), ExitCode: -1}
+	}
+	pythonExe, err := resolvePythonExecutable()
+	if err != nil {
+		return runPythonResp{Error: err.Error()}
+	}
+	argv := append([]string{"-m", module}, args...)
+	cmd := exec.CommandContext(ctx, pythonExe, argv...)
+	cmd.Dir = workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &limitWriter{dst: &stdout, max: maxPythonOutput}
+	cmd.Stderr = &limitWriter{dst: &stderr, max: maxPythonOutput}
+	runErr := cmd.Run()
+	resp := runPythonResp{
+		Stdout: strings.TrimSuffix(stdout.String(), "\n"),
+		Stderr: strings.TrimSuffix(stderr.String(), "\n"),
+	}
+	if runErr != nil {
+		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			resp.Error = "python run timed out"
+			resp.ExitCode = -1
+		} else if ee := (*exec.ExitError)(nil); errors.As(runErr, &ee) {
+			resp.ExitCode = ee.ExitCode()
+		} else {
+			resp.Error = runErr.Error()
+			resp.ExitCode = -1
+		}
+	}
+	return resp
+}
+
+func agentMaxSteps(requested int) int {
+	const hardCap = 15
+	defaultSteps := 12
+	if v := strings.TrimSpace(os.Getenv("AGENT_MAX_STEPS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			defaultSteps = n
+		}
+	}
+	max := defaultSteps
+	if requested > 0 {
+		max = requested
+	}
+	if max > hardCap {
+		max = hardCap
+	}
+	if max < 1 {
+		max = 1
+	}
+	return max
 }
 
 type limitWriter struct {
@@ -194,6 +323,100 @@ func resolvePythonExecutable() (string, error) {
 		}
 	}
 	return "", errors.New("python not found on PATH (set PYTHON_BIN or install Python)")
+}
+
+var skipPythonWalkDirNames = map[string]struct{}{
+	".git": {}, ".venv": {}, "venv": {}, "__pycache__": {}, "node_modules": {},
+	".mypy_cache": {}, ".tox": {}, ".cursorlite": {},
+}
+
+// errWorkspacePyListCap stops workspacePythonRelPaths once enough paths are collected.
+var errWorkspacePyListCap = errors.New("workspace python list cap")
+
+// workspacePythonRelPaths returns sorted workspace-relative paths of .py files for agent context (capped).
+func workspacePythonRelPaths(root string, limit int) []string {
+	if limit <= 0 {
+		limit = 200
+	}
+	out := make([]string, 0, min(limit, 64))
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if _, skip := skipPythonWalkDirNames[d.Name()]; skip {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.ToLower(filepath.Ext(path)) != ".py" {
+			return nil
+		}
+		if !underRoot(root, path) {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		out = append(out, filepath.ToSlash(rel))
+		if len(out) >= limit {
+			return errWorkspacePyListCap
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errWorkspacePyListCap) {
+		sort.Strings(out)
+		return out
+	}
+	sort.Strings(out)
+	return out
+}
+
+// workspacePythonFingerprints maps workspace-relative paths of .py files to a cheap size+mtime fingerprint.
+func workspacePythonFingerprints(root string) (map[string]int64, error) {
+	out := make(map[string]int64)
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if _, skip := skipPythonWalkDirNames[d.Name()]; skip {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.ToLower(filepath.Ext(path)) != ".py" {
+			return nil
+		}
+		if !underRoot(root, path) {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		st, err := d.Info()
+		if err != nil {
+			return err
+		}
+		out[rel] = st.Size() ^ int64(st.ModTime().UnixNano())
+		return nil
+	})
+	return out, err
+}
+
+func pythonWorkspaceChanged(before, after map[string]int64) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for k, v := range after {
+		if before[k] != v {
+			return true
+		}
+	}
+	return false
 }
 
 func underRoot(root, full string) bool {
@@ -328,123 +551,6 @@ func handleWriteFile(w http.ResponseWriter, r *http.Request, root string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-type chatReq struct {
-	Message     string `json:"message"`
-	FilePath    string `json:"filePath,omitempty"`
-	FileContent string `json:"fileContent,omitempty"`
-}
-
-type fileEdit struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-}
-
-type chatResp struct {
-	Reply string     `json:"reply"`
-	Edits []fileEdit `json:"edits,omitempty"`
-	Error string     `json:"error,omitempty"`
-}
-
-type modelChatJSON struct {
-	Summary string     `json:"summary"`
-	Files   []fileEdit `json:"files"`
-}
-
-func handleChat(w http.ResponseWriter, r *http.Request, root string) {
-	var req chatReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
-	key := os.Getenv("OPENAI_API_KEY")
-	base := os.Getenv("OPENAI_BASE_URL")
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	if key == "" {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(chatResp{
-			Error: "Set OPENAI_API_KEY in the container to enable chat. Example: docker compose with env from .env",
-		})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	raw, err := openAIChatStructured(base, key, req)
-	if err != nil {
-		_ = json.NewEncoder(w).Encode(chatResp{Error: err.Error()})
-		return
-	}
-	summary, edits, perr := parseModelChatOutput(raw)
-	if perr != nil {
-		summary = strings.TrimSpace(raw)
-		edits = nil
-	} else if strings.TrimSpace(summary) == "" && len(edits) > 0 {
-		summary = "Applied updates to your workspace."
-	} else if strings.TrimSpace(summary) == "" && len(edits) == 0 {
-		summary = "Done."
-	}
-	validated := make([]fileEdit, 0, len(edits))
-	const maxEdit = 2 << 20 // 2 MiB per file from model
-	for _, e := range edits {
-		rel := strings.TrimSpace(e.Path)
-		rel = filepath.ToSlash(filepath.Clean(rel))
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" || rel == "." {
-			continue
-		}
-		full, err := safeRel(root, rel)
-		if err != nil || !underRoot(root, full) {
-			continue
-		}
-		if len(e.Content) > maxEdit {
-			continue
-		}
-		validated = append(validated, fileEdit{Path: rel, Content: e.Content})
-	}
-	_ = json.NewEncoder(w).Encode(chatResp{Reply: summary, Edits: validated})
-}
-
-func chatSystemPrompt() string {
-	return `You are a Python development assistant inside a small web IDE. The user message includes their request and may include the currently open file path and its full contents.
-
-You MUST respond with a single JSON object only (no markdown fences), using this exact shape:
-{"summary":"Brief explanation shown in chat.","files":[{"path":"relative/path/from/workspace/root.py","content":"complete new file contents as a string"}]}
-
-Rules:
-- "files" is an array. Include every workspace file you create or change, each with full file text (not a diff).
-- Paths use forward slashes relative to the workspace root (e.g. "hello.py", "src/app.py").
-- If you only explain or answer without changing files, use "files": [].
-- Prefer idiomatic Python 3; keep code runnable and consistent with the user's request.
-- Produce strictly valid JSON: escape embedded quotes and newlines in strings as JSON requires.`
-}
-
-func buildChatUserPayload(req chatReq) string {
-	var b strings.Builder
-	b.WriteString("User request:\n")
-	b.WriteString(strings.TrimSpace(req.Message))
-	b.WriteString("\n\n")
-	if strings.TrimSpace(req.FilePath) != "" {
-		b.WriteString("Currently open file path (relative to workspace): ")
-		b.WriteString(strings.TrimSpace(req.FilePath))
-		b.WriteString("\n\nCurrent file contents:\n```\n")
-		b.WriteString(req.FileContent)
-		b.WriteString("\n```\n")
-	} else {
-		b.WriteString("No file is currently open in the editor. You may still add or modify files by path under \"files\".\n")
-	}
-	return b.String()
-}
-
-func parseModelChatOutput(raw string) (summary string, files []fileEdit, err error) {
-	raw = strings.TrimSpace(raw)
-	raw = stripMarkdownJSONFence(raw)
-	var out modelChatJSON
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return "", nil, err
-	}
-	return strings.TrimSpace(out.Summary), out.Files, nil
-}
-
 func stripMarkdownJSONFence(s string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "```") {
@@ -458,6 +564,15 @@ func stripMarkdownJSONFence(s string) string {
 		rest = rest[:i]
 	}
 	return strings.TrimSpace(rest)
+}
+
+const defaultOpenAIModel = "gpt-4o-mini"
+
+func resolveOpenAIModel() string {
+	if m := strings.TrimSpace(os.Getenv("OPENAI_MODEL")); m != "" {
+		return m
+	}
+	return defaultOpenAIModel
 }
 
 type openAIRequest struct {
@@ -486,22 +601,6 @@ type openAIResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
-}
-
-func openAIChatStructured(baseURL, apiKey string, req chatReq) (string, error) {
-	model := os.Getenv("OPENAI_MODEL")
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
-	msgs := []openAIMessage{
-		{Role: "system", Content: chatSystemPrompt()},
-		{Role: "user", Content: buildChatUserPayload(req)},
-	}
-	content, err := completeChat(baseURL, apiKey, model, msgs, true)
-	if err != nil {
-		return "", err
-	}
-	return content, nil
 }
 
 func completeChat(baseURL, apiKey, model string, messages []openAIMessage, jsonMode bool) (string, error) {

@@ -12,6 +12,7 @@
   <header class="top">
     <span class="logo">Cursorlite · Python</span>
     <span id="status" class="status"></span>
+    <button type="button" id="acceptBtn" class="btn" title="Treat current editor text as accepted (clears change highlights; does not write to disk)">Accept</button>
     <button type="button" id="saveBtn" class="btn primary">Save</button>
   </header>
   <div class="layout">
@@ -26,22 +27,49 @@
       </div>
       <div class="editor-console-stack">
         <div id="editorArea" class="editor-area"></div>
-        <div class="console-panel">
-          <div class="panel-title console-title">Python output</div>
-          <pre id="consoleOutput" class="console-output"></pre>
-        </div>
       </div>
       <textarea id="editorFallback" hidden></textarea>
     </main>
-    <aside class="chat">
-      <div class="panel-title">Chat</div>
-      <div id="chatLog" class="chat-log"></div>
-      <form id="chatForm" class="chat-form">
-        <textarea id="chatInput" rows="3" placeholder="Describe changes — open a .py file to edit it, or ask for new files by path…"></textarea>
-        <button type="submit" class="btn">Send</button>
+    <aside class="agent-panel">
+      <div class="agent-panel-head">
+        <div class="panel-title">CodeAct agent</div>
+        <div class="agent-panel-actions">
+          <button type="button" id="agentUndoBtn" class="btn btn-ghost" disabled title="Restore all workspace .py files to how they were right before the last agent run (does not remove new files)">Undo last run</button>
+          <button type="button" id="agentHistoryRefresh" class="btn btn-ghost" title="Reload chat history from disk">History</button>
+        </div>
+      </div>
+      <div id="agentChat" class="agent-chat" aria-label="Agent chat history"></div>
+      <p class="codeact-hint">The model emits Python; the server runs it and feeds stdout/stderr back until the goal is done. Set <code>OPENAI_API_KEY</code>. With a file open, your <strong>cursor line</strong> and any <strong>selection</strong> are sent with each run (like line context in Cursor). Drag files onto this panel to attach extras. Prompts are stored in the workspace database and shown below like a chat.</p>
+      <div id="agentAttachments" class="agent-attachments" aria-label="Attached files"></div>
+      <div class="agent-run-warning" role="note">
+        <strong class="agent-run-warning-title">Before running the agent again</strong>
+        <p class="agent-run-warning-text">
+          Make sure to <strong>Accept</strong> and <strong>Save</strong> your editor changes first. The agent reads files from disk; anything you have not accepted or saved will not match what the agent sees.
+        </p>
+      </div>
+      <form id="agentForm" class="agent-form">
+        <textarea id="agentInput" rows="2" placeholder="Goal (e.g. list files, create a script, run a check)…"></textarea>
+        <button type="submit" class="btn">Run agent</button>
       </form>
     </aside>
   </div>
+
+  <div id="runConsoleOverlay" class="run-console-overlay" hidden>
+    <div class="run-console-backdrop" data-close-run-console></div>
+    <div class="run-console-dialog" role="dialog" aria-labelledby="runConsoleTitle">
+      <div class="run-console-header">
+        <span id="runConsoleTitle" class="run-console-title">Running</span>
+        <button type="button" id="runConsoleClose" class="btn run-console-close">Close</button>
+      </div>
+      <pre id="runConsoleOut" class="run-console-out" aria-live="polite"></pre>
+      <form id="runConsoleForm" class="run-console-form">
+        <label class="run-console-input-label" for="runConsoleLine">stdin</label>
+        <input type="text" id="runConsoleLine" class="run-console-line" autocomplete="off" spellcheck="false" placeholder="Type a line for input(), then Enter" disabled />
+        <button type="submit" class="btn" id="runConsoleSend" disabled>Send</button>
+      </form>
+    </div>
+  </div>
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>

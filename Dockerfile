@@ -2,7 +2,7 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY *.go ./
 COPY static ./static
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /cursorlite .
