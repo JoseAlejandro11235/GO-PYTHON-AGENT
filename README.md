@@ -19,7 +19,7 @@ From the repository root:
 ```bash
 export WORKSPACE_ROOT=./workspace
 export OPENAI_API_KEY=sk-...
-go run .
+go run ./cmd/cursorlite
 ```
 
 Open [http://localhost:8080](http://localhost:8080).
@@ -51,7 +51,7 @@ The **CodeAct** panel sends a goal to `POST /api/agent-code`. The backend asks t
 
 ## Security and limits
 
-Generated code is **not** a true sandbox: it runs as the server user with access to everything under `WORKSPACE_ROOT` (and whatever the process can reach). Mitigations in this POC: paths are constrained with `safeRel` / `underRoot`, Python output and run duration are capped, and agent turns are capped. **Do not** point `WORKSPACE_ROOT` at sensitive data for untrusted models.
+Generated code is **not** a true sandbox: it runs as the server user with access to everything under `WORKSPACE_ROOT` (and whatever the process can reach). Mitigations in this POC: paths are constrained with `paths.SafeRel` / `paths.UnderRoot`, Python output and run duration are capped, and agent turns are capped. **Do not** point `WORKSPACE_ROOT` at sensitive data for untrusted models.
 
 ## Demo script (interview)
 
@@ -61,8 +61,14 @@ Generated code is **not** a true sandbox: it runs as the server user with access
 
 ## Project layout
 
-- `main.go` — HTTP API, tree/files, Python runner, LLM helpers, agent route registration
-- `agent.go` — CodeAct loop and prompts
-- `static/` — embedded UI
+- [`cmd/cursorlite/main.go`](cmd/cursorlite/main.go) — process entry: workspace root, DB open, HTTP listen
+- [`internal/server/`](internal/server/) — HTTP routes, workspace file API, Python run + WebSocket
+- [`internal/agent/`](internal/agent/) — CodeAct loop, prompts, step limits
+- [`internal/python/`](internal/python/) — workspace Python execution
+- [`internal/openai/`](internal/openai/) — chat completions client
+- [`internal/prompts/`](internal/prompts/) — SQLite prompt history
+- [`internal/undo/`](internal/undo/) — agent undo snapshot
+- [`internal/paths/`](internal/paths/), [`internal/pywalk/`](internal/pywalk/) — path safety and `.py` workspace scans
+- [`internal/web/static/`](internal/web/static/) — embedded UI (served from `/`)
 
 See [`.env.example`](.env.example) for environment variable names.

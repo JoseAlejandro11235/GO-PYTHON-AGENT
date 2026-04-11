@@ -1,4 +1,4 @@
-package main
+package agent
 
 import (
 	"context"
@@ -12,49 +12,54 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"cursorlite/internal/openai"
+	"cursorlite/internal/prompts"
+	"cursorlite/internal/python"
+	"cursorlite/internal/pywalk"
+	"cursorlite/internal/undo"
 )
 
-type agentAttachedFile struct {
+type AttachedFile struct {
 	Name    string `json:"name"`
 	Content string `json:"content"`
 }
 
-type agentCodeReq struct {
-	Message       string              `json:"message"`
-	FilePath      string              `json:"filePath,omitempty"`
-	FileContent   string              `json:"fileContent,omitempty"`
-	AttachedFiles []agentAttachedFile `json:"attachedFiles,omitempty"`
-	Cwd           string              `json:"cwd,omitempty"`
-	MaxSteps      int                 `json:"maxSteps,omitempty"`
-	// IDE context (1-based lines), from CodeMirror when a file is open
-	EditorLine         int    `json:"editorLine,omitempty"`
-	SelectionStartLine int    `json:"selectionStartLine,omitempty"`
-	SelectionEndLine   int    `json:"selectionEndLine,omitempty"`
-	HasSelection       bool   `json:"hasSelection,omitempty"`
-	SelectionText      string `json:"selectionText,omitempty"`
-	LineAtCursor       string `json:"lineAtCursor,omitempty"` // single line at cursor when there is no selection
+type CodeReq struct {
+	Message       string          `json:"message"`
+	FilePath      string          `json:"filePath,omitempty"`
+	FileContent   string          `json:"fileContent,omitempty"`
+	AttachedFiles []AttachedFile  `json:"attachedFiles,omitempty"`
+	Cwd           string          `json:"cwd,omitempty"`
+	MaxSteps      int             `json:"maxSteps,omitempty"`
+	EditorLine    int             `json:"editorLine,omitempty"`
+	SelectionStartLine int        `json:"selectionStartLine,omitempty"`
+	SelectionEndLine   int        `json:"selectionEndLine,omitempty"`
+	HasSelection  bool            `json:"hasSelection,omitempty"`
+	SelectionText string          `json:"selectionText,omitempty"`
+	LineAtCursor  string          `json:"lineAtCursor,omitempty"`
 }
 
-type agentStepOut struct {
+type StepOut struct {
 	Rationale string        `json:"rationale,omitempty"`
 	Python    string        `json:"python"`
-	Run       runPythonResp `json:"run"`
+	Run       python.Output `json:"run"`
 }
 
-type agentCodeResp struct {
-	Summary string         `json:"summary"`
-	Steps   []agentStepOut `json:"steps"`
-	Error   string         `json:"error,omitempty"`
+type CodeResp struct {
+	Summary string    `json:"summary"`
+	Steps   []StepOut `json:"steps"`
+	Error   string    `json:"error,omitempty"`
 }
 
-type agentTurnJSON struct {
+type turnJSON struct {
 	Rationale string `json:"rationale"`
 	Python    string `json:"python"`
 	Done      bool   `json:"done"`
 	Summary   string `json:"summary"`
 }
 
-func agentSystemPrompt() string {
+func systemPrompt() string {
 	return `You control a Python 3 workspace via executable code (CodeAct). Each turn you output ONE JSON object only (no markdown fences).
 
 Schema:
@@ -77,13 +82,13 @@ Rules:
 - When your goal implied shipping code files, the server checks that some .py file in the workspace actually changed before it accepts "done": true.`
 }
 
-func buildAgentUserPayload(req agentCodeReq, root string) string {
+func buildUserPayload(req CodeReq, root string) string {
 	var b strings.Builder
 	b.WriteString("User goal:\n")
 	b.WriteString(strings.TrimSpace(req.Message))
 	b.WriteString("\n\n")
 
-	paths := workspacePythonRelPaths(root, 150)
+	paths := pywalk.PythonRelPaths(root, 150)
 	if len(paths) > 0 {
 		b.WriteString("Existing .py files under the workspace (edit these with read_text → modify → write_text when relevant; list may be truncated):\n")
 		for _, p := range paths {
@@ -149,17 +154,16 @@ func buildAgentUserPayload(req agentCodeReq, root string) string {
 	return b.String()
 }
 
-func parseAgentTurn(raw string) (agentTurnJSON, error) {
+func parseTurn(raw string) (turnJSON, error) {
 	raw = strings.TrimSpace(raw)
-	raw = stripMarkdownJSONFence(raw)
-	var out agentTurnJSON
+	raw = openai.StripMarkdownJSONFence(raw)
+	var out turnJSON
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return agentTurnJSON{}, err
+		return turnJSON{}, err
 	}
 	return out, nil
 }
 
-// goalImpliesPythonDeliverable is a lightweight heuristic for when we require a workspace .py change before done.
 func goalImpliesPythonDeliverable(msg string) bool {
 	m := strings.ToLower(strings.TrimSpace(msg))
 	if m == "" {
@@ -195,36 +199,32 @@ func formatFileDeliverableRejection() string {
 For implementable deliverables you must change real files on disk: read existing paths with pathlib.Path(...).read_text(encoding="utf-8"), apply edits, then write_text(..., encoding="utf-8") — or create a new .py if appropriate — then set "done": true after verifying.`
 }
 
-func agentVerifyEnabled() bool {
+func verifyEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("AGENT_VERIFY")))
 	return v != "0" && v != "false" && v != "off" && v != "no"
 }
 
-func isPytestMissing(resp runPythonResp) bool {
-	// Missing package or invocation error before pytest runs tests.
+func isPytestMissing(resp python.Output) bool {
 	combined := strings.ToLower(resp.Stdout + "\n" + resp.Stderr + "\n" + resp.Error)
 	return strings.Contains(combined, "no module named pytest") ||
 		strings.Contains(combined, "unknown command: pytest")
 }
 
-// runAutomatedTestGate runs pytest when enabled. ok==true means the run is acceptable to complete the request.
-// ran==false means the gate was skipped (verification disabled, or pytest not available).
-func runAutomatedTestGate(ctx context.Context, root, cwdRel string) (resp runPythonResp, ran bool, ok bool) {
-	if !agentVerifyEnabled() {
-		return runPythonResp{}, false, true
+func runAutomatedTestGate(ctx context.Context, root, cwdRel string) (resp python.Output, ran bool, ok bool) {
+	if !verifyEnabled() {
+		return python.Output{}, false, true
 	}
-	resp = runPythonModuleInWorkspace(ctx, root, cwdRel, "pytest", "-q", "--tb=short")
+	resp = python.RunModule(ctx, root, cwdRel, "pytest", "-q", "--tb=short")
 	if isPytestMissing(resp) {
-		return runPythonResp{}, false, true
+		return python.Output{}, false, true
 	}
-	// Pytest: 0 = pass, 5 = no tests collected (empty project is OK).
 	if resp.ExitCode == 0 || resp.ExitCode == 5 {
 		return resp, true, true
 	}
 	return resp, true, false
 }
 
-func formatVerificationRejection(resp runPythonResp) string {
+func formatVerificationRejection(resp python.Output) string {
 	var b strings.Builder
 	b.WriteString("You set \"done\": true but automated verification did not pass.\n")
 	b.WriteString(`The server ran: ` + "`python -m pytest -q --tb=short`" + ` in the workspace.\n`)
@@ -233,7 +233,7 @@ func formatVerificationRejection(resp runPythonResp) string {
 	return b.String()
 }
 
-func formatExecutionFeedback(resp runPythonResp) string {
+func formatExecutionFeedback(resp python.Output) string {
 	var b strings.Builder
 	b.WriteString("Execution result:\n")
 	b.WriteString(fmt.Sprintf("exit_code: %d\n", resp.ExitCode))
@@ -255,8 +255,8 @@ func formatExecutionFeedback(resp runPythonResp) string {
 	return b.String()
 }
 
-func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sql.DB) {
-	var req agentCodeReq
+func HandleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sql.DB) {
+	var req CodeReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
@@ -266,17 +266,17 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 		return
 	}
 
-	if err := saveAgentUndoSnapshot(root); err != nil {
+	if err := undo.SaveSnapshot(root); err != nil {
 		log.Printf("agent undo snapshot: %v", err)
 	}
 
-	userPayload := buildAgentUserPayload(req, root)
-	sysPrompt := agentSystemPrompt()
-	model := resolveOpenAIModel()
-	maxSteps := agentMaxSteps(req.MaxSteps)
+	userPayload := buildUserPayload(req, root)
+	sysPrompt := systemPrompt()
+	model := openai.ResolveModel()
+	maxS := maxSteps(req.MaxSteps)
 
-	var msgs []openAIMessage
-	var steps []agentStepOut
+	var msgs []openai.Message
+	var steps []StepOut
 	var summary string
 	var errStr string
 
@@ -289,7 +289,20 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 			msgJSON, _ = json.Marshal(msgs)
 		}
 		stepJSON, _ := json.Marshal(steps)
-		if err := insertAgentPrompt(r.Context(), db, req, userPayload, sysPrompt, model, maxSteps, summary, errStr, msgJSON, stepJSON); err != nil {
+		if err := prompts.InsertAgentPrompt(r.Context(), db, prompts.InsertParams{
+			Message:       req.Message,
+			UserPayload:   userPayload,
+			SystemPrompt:  sysPrompt,
+			FilePath:      req.FilePath,
+			Cwd:           req.Cwd,
+			Model:         model,
+			MaxSteps:      maxS,
+			Summary:       summary,
+			ErrStr:        errStr,
+			MessagesJSON:  msgJSON,
+			StepsJSON:     stepJSON,
+			AttachedCount: len(req.AttachedFiles),
+		}); err != nil {
 			log.Printf("prompts db: %v", err)
 		}
 	}()
@@ -302,45 +315,45 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 	w.Header().Set("Content-Type", "application/json")
 	if key == "" {
 		errStr = "Set OPENAI_API_KEY to use the CodeAct agent."
-		msgs = []openAIMessage{
+		msgs = []openai.Message{
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: userPayload},
 		}
-		_ = json.NewEncoder(w).Encode(agentCodeResp{
+		_ = json.NewEncoder(w).Encode(CodeResp{
 			Error: errStr,
 		})
 		return
 	}
 
-	msgs = []openAIMessage{
+	msgs = []openai.Message{
 		{Role: "system", Content: sysPrompt},
 		{Role: "user", Content: userPayload},
 	}
-	pyTimeout := pythonRunTimeout()
-	overallDeadline := time.Now().Add(time.Duration(maxSteps+2) * pyTimeout)
+	pyTimeout := python.RunTimeout()
+	overallDeadline := time.Now().Add(time.Duration(maxS+2) * pyTimeout)
 	if dl, ok := r.Context().Deadline(); ok && dl.Before(overallDeadline) {
 		overallDeadline = dl
 	}
 
-	beforePy, _ := workspacePythonFingerprints(root)
+	beforePy, _ := pywalk.PythonFingerprints(root)
 	if beforePy == nil {
 		beforePy = map[string]int64{}
 	}
 
-	for range maxSteps {
+	for range maxS {
 		ctxCall, cancelCall := context.WithDeadline(r.Context(), overallDeadline)
 		raw, err := completeChatInContext(ctxCall, base, key, model, msgs, true)
 		cancelCall()
 		if err != nil {
 			errStr = err.Error()
-			_ = json.NewEncoder(w).Encode(agentCodeResp{Summary: summary, Steps: steps, Error: errStr})
+			_ = json.NewEncoder(w).Encode(CodeResp{Summary: summary, Steps: steps, Error: errStr})
 			return
 		}
 
-		turn, err := parseAgentTurn(raw)
+		turn, err := parseTurn(raw)
 		if err != nil {
-			msgs = append(msgs, openAIMessage{Role: "assistant", Content: raw})
-			msgs = append(msgs, openAIMessage{Role: "user", Content: "Your last message was not valid JSON matching the schema. Reply with a single JSON object only (rationale, python, done, summary when done)."})
+			msgs = append(msgs, openai.Message{Role: "assistant", Content: raw})
+			msgs = append(msgs, openai.Message{Role: "user", Content: "Your last message was not valid JSON matching the schema. Reply with a single JSON object only (rationale, python, done, summary when done)."})
 			continue
 		}
 
@@ -355,7 +368,7 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 			cancelVerify()
 
 			if vRan {
-				steps = append(steps, agentStepOut{
+				steps = append(steps, StepOut{
 					Rationale: "Server: automated verification before completing",
 					Python:    "python -m pytest -q --tb=short",
 					Run:       vResp,
@@ -363,19 +376,19 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 			}
 
 			if vRan && !vOK {
-				msgs = append(msgs, openAIMessage{Role: "assistant", Content: raw})
-				msgs = append(msgs, openAIMessage{Role: "user", Content: formatVerificationRejection(vResp)})
+				msgs = append(msgs, openai.Message{Role: "assistant", Content: raw})
+				msgs = append(msgs, openai.Message{Role: "user", Content: formatVerificationRejection(vResp)})
 				continue
 			}
 
 			if goalImpliesPythonDeliverable(req.Message) {
-				afterPy, err := workspacePythonFingerprints(root)
+				afterPy, err := pywalk.PythonFingerprints(root)
 				if err != nil {
 					afterPy = map[string]int64{}
 				}
-				if !pythonWorkspaceChanged(beforePy, afterPy) {
-					msgs = append(msgs, openAIMessage{Role: "assistant", Content: raw})
-					msgs = append(msgs, openAIMessage{Role: "user", Content: formatFileDeliverableRejection()})
+				if !pywalk.PythonWorkspaceChanged(beforePy, afterPy) {
+					msgs = append(msgs, openai.Message{Role: "assistant", Content: raw})
+					msgs = append(msgs, openai.Message{Role: "user", Content: formatFileDeliverableRejection()})
 					continue
 				}
 			}
@@ -386,28 +399,28 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 
 		code := strings.TrimSpace(turn.Python)
 		if code == "" {
-			msgs = append(msgs, openAIMessage{Role: "assistant", Content: raw})
-			msgs = append(msgs, openAIMessage{Role: "user", Content: `You set "done": false but "python" is empty. Provide Python to run, or set "done": true with a "summary".`})
+			msgs = append(msgs, openai.Message{Role: "assistant", Content: raw})
+			msgs = append(msgs, openai.Message{Role: "user", Content: `You set "done": false but "python" is empty. Provide Python to run, or set "done": true with a "summary".`})
 			continue
 		}
 
 		ctxPy, cancelPy := context.WithDeadline(r.Context(), overallDeadline)
 		pyCtx, cancelPyTimeout := context.WithTimeout(ctxPy, pyTimeout)
-		runResp, runErr := runPythonInWorkspace(pyCtx, root, code, req.Cwd, "")
+		runResp, runErr := python.RunInWorkspace(pyCtx, root, code, req.Cwd, "")
 		cancelPyTimeout()
 		cancelPy()
 		if runErr != nil {
-			runResp = runPythonResp{Error: runErr.Error(), ExitCode: -1}
+			runResp = python.Output{Error: runErr.Error(), ExitCode: -1}
 		}
 
-		steps = append(steps, agentStepOut{
+		steps = append(steps, StepOut{
 			Rationale: turn.Rationale,
 			Python:    code,
 			Run:       runResp,
 		})
 
-		msgs = append(msgs, openAIMessage{Role: "assistant", Content: raw})
-		msgs = append(msgs, openAIMessage{Role: "user", Content: formatExecutionFeedback(runResp)})
+		msgs = append(msgs, openai.Message{Role: "assistant", Content: raw})
+		msgs = append(msgs, openai.Message{Role: "user", Content: formatExecutionFeedback(runResp)})
 	}
 
 	if summary == "" && len(steps) > 0 {
@@ -416,17 +429,17 @@ func handleAgentCode(w http.ResponseWriter, r *http.Request, root string, db *sq
 	if summary == "" {
 		summary = "Agent finished without a summary. Check the transcript or increase max steps."
 	}
-	_ = json.NewEncoder(w).Encode(agentCodeResp{Summary: summary, Steps: steps})
+	_ = json.NewEncoder(w).Encode(CodeResp{Summary: summary, Steps: steps})
 }
 
-func completeChatInContext(ctx context.Context, baseURL, apiKey, model string, messages []openAIMessage, jsonMode bool) (string, error) {
+func completeChatInContext(ctx context.Context, baseURL, apiKey, model string, messages []openai.Message, jsonMode bool) (string, error) {
 	type result struct {
 		text string
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		text, err := completeChat(baseURL, apiKey, model, messages, jsonMode)
+		text, err := openai.CompleteChat(baseURL, apiKey, model, messages, jsonMode)
 		ch <- result{text, err}
 	}()
 	select {

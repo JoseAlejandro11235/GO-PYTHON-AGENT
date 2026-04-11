@@ -1,110 +1,15 @@
-package main
+package prompts
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-func promptDBPath(root string) string {
-	if p := strings.TrimSpace(os.Getenv("PROMPTS_DB_PATH")); p != "" {
-		return p
-	}
-	return filepath.Join(root, cursorliteInternalDir, "prompts.db")
-}
-
-func openPromptDB(root string) (*sql.DB, error) {
-	path := promptDBPath(root)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	if err := migratePrompts(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
-func migratePrompts(db *sql.DB) error {
-	if _, err := db.Exec(`
-CREATE TABLE IF NOT EXISTS agent_prompts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT NOT NULL,
-  user_message TEXT NOT NULL,
-  user_payload TEXT NOT NULL,
-  system_prompt TEXT NOT NULL,
-  messages_json TEXT,
-  file_path TEXT,
-  cwd TEXT,
-  model TEXT,
-  max_steps INTEGER NOT NULL DEFAULT 0,
-  summary TEXT,
-  error TEXT,
-  steps_json TEXT,
-  attached_count INTEGER NOT NULL DEFAULT 0
-);`); err != nil {
-		return err
-	}
-	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_prompts_created ON agent_prompts(created_at DESC);`)
-	return err
-}
-
-func insertAgentPrompt(ctx context.Context, db *sql.DB, req agentCodeReq, userPayload, sysPrompt, model string, maxSteps int, summary, errStr string, messagesJSON, stepsJSON []byte) error {
-	if db == nil {
-		return nil
-	}
-	created := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := db.ExecContext(ctx, `
-INSERT INTO agent_prompts (
-  created_at, user_message, user_payload, system_prompt, messages_json,
-  file_path, cwd, model, max_steps, summary, error, steps_json, attached_count
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		created,
-		strings.TrimSpace(req.Message),
-		userPayload,
-		sysPrompt,
-		nullIfEmptyBytes(messagesJSON),
-		nullStr(strings.TrimSpace(req.FilePath)),
-		nullStr(strings.TrimSpace(req.Cwd)),
-		nullStr(strings.TrimSpace(model)),
-		maxSteps,
-		nullStr(strings.TrimSpace(summary)),
-		nullStr(strings.TrimSpace(errStr)),
-		nullIfEmptyBytes(stepsJSON),
-		len(req.AttachedFiles),
-	)
-	return err
-}
-
-func nullStr(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
-func nullIfEmptyBytes(b []byte) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return string(b)
-}
-
-type promptListRow struct {
+type ListRow struct {
 	ID          int64  `json:"id"`
 	CreatedAt   string `json:"createdAt"`
 	UserMessage string `json:"userMessage"`
@@ -113,8 +18,8 @@ type promptListRow struct {
 	StepCount   int    `json:"stepCount"`
 }
 
-type promptDetail struct {
-	promptListRow
+type Detail struct {
+	ListRow
 	UserPayload   string          `json:"userPayload"`
 	SystemPrompt  string          `json:"systemPrompt"`
 	FilePath      string          `json:"filePath,omitempty"`
@@ -126,7 +31,7 @@ type promptDetail struct {
 	AttachedCount int             `json:"attachedCount"`
 }
 
-func handlePromptsAPI(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+func HandleAPI(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	if db == nil {
 		http.Error(w, "prompts database unavailable", http.StatusServiceUnavailable)
 		return
@@ -156,7 +61,7 @@ LIMIT ?`, limit)
 		return
 	}
 	defer rows.Close()
-	out := []promptListRow{}
+	out := []ListRow{}
 	for rows.Next() {
 		var id int64
 		var created, userMsg, summary, errStr sql.NullString
@@ -166,7 +71,7 @@ LIMIT ?`, limit)
 			return
 		}
 		stepCount := countStepsJSON(steps.String)
-		out = append(out, promptListRow{
+		out = append(out, ListRow{
 			ID:          id,
 			CreatedAt:   created.String,
 			UserMessage: userMsg.String,
@@ -184,7 +89,7 @@ func countStepsJSON(s string) int {
 	if s == "" {
 		return 0
 	}
-	var steps []agentStepOut
+	var steps []json.RawMessage
 	if err := json.Unmarshal([]byte(s), &steps); err != nil {
 		return 0
 	}
@@ -197,7 +102,7 @@ func handleGetPrompt(w http.ResponseWriter, r *http.Request, db *sql.DB, idStr s
 		http.Error(w, "bad id", http.StatusBadRequest)
 		return
 	}
-	var row promptDetail
+	var row Detail
 	var filePath, cwd, model sql.NullString
 	var summaryNS, errorNS sql.NullString
 	var maxSteps int

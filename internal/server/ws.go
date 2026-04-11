@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"cursorlite/internal/python"
 
 	"github.com/gorilla/websocket"
 )
@@ -62,23 +64,23 @@ func handleRunPythonWS(w http.ResponseWriter, r *http.Request, root string) {
 		return
 	}
 
-	workDir, err := resolveWorkspaceWorkDir(root, start.Cwd)
+	workDir, err := python.ResolveWorkDir(root, start.Cwd)
 	if err != nil {
 		_ = conn.WriteJSON(wsServerMsg{Type: "error", Message: err.Error()})
 		return
 	}
-	scriptPath, err := prepareCursorliteRunScript(workDir, code)
+	scriptPath, err := python.PrepareRunScript(workDir, code)
 	if err != nil {
 		_ = conn.WriteJSON(wsServerMsg{Type: "error", Message: err.Error()})
 		return
 	}
-	pythonExe, err := resolvePythonExecutable()
+	pythonExe, err := python.ResolveExecutable()
 	if err != nil {
 		_ = conn.WriteJSON(wsServerMsg{Type: "error", Message: err.Error()})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), pythonRunTimeout())
+	ctx, cancel := context.WithTimeout(r.Context(), python.RunTimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, pythonExe, "-u", scriptPath)
@@ -117,7 +119,7 @@ func handleRunPythonWS(w http.ResponseWriter, r *http.Request, root string) {
 		for {
 			n, rerr := r.Read(buf)
 			if n > 0 {
-				if outBytes.Add(int64(n)) > maxPythonOutput {
+				if outBytes.Add(int64(n)) > python.MaxOutputBytes {
 					cancel()
 					return
 				}
